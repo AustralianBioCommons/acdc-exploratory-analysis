@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "acdc-exploratory-analysis"
+version = "0.1.0"
+description = "Exploratory analysis of ACDC clinical data pulled via gen3-metadata, using marimo notebooks."
+authors = ["Joshua Harris <joshymole@gmail.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+marimo = "*"
+gen3-metadata = "1.4.0"
+pandas = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

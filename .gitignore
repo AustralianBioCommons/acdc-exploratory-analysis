@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Poetry
+# poetry.lock is intentionally tracked
+
+# Marimo
+.marimo/
+__marimo__/
+
+# Credentials / secrets
+credentials.json
+*.key
+*.pem
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
