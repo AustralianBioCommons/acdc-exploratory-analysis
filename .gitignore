@@ -31,3 +31,6 @@ Thumbs.db
 # Editors
 .idea/
 .vscode/
+
+# Generated analysis outputs
+outputs/
