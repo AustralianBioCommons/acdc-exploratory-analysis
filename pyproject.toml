@@ -12,6 +12,8 @@ marimo = "*"
 gen3-metadata = "1.4.0"
 pandas = "*"
 nbformat = "^5.10.4"
+matplotlib = "^3.10.9"
+scipy = "^1.17.1"
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]
