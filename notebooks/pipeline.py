@@ -9,12 +9,16 @@ def _(mo):
     mo.md("""
     # ACDC exploratory analysis
 
-    Baseline metadata for the CDAH and EDCAD-PMS cohorts were retrieved
-    live from Gen3 and flattened to one record per subject. We report
-    (i) cohort characteristics, (ii) variable- and subject-level missing
-    data, (iii) within-cohort Spearman rank correlations across a
-    pre-specified panel of clinical variables, and (iv) cross-cohort
-    correlation deviation as a triage map for measurement disagreement.
+    This notebook analyses the **clinical variables defined in the
+    ACDC Gen3 Data Dictionary** across one or more contributing
+    cohorts (configured at the top of the notebook). Baseline metadata
+    are retrieved live from Gen3 and flattened to one record per
+    subject, after which we report (i) cohort characteristics, (ii)
+    variable- and subject-level missing data, (iii) within-cohort
+    Spearman rank correlations across a pre-specified panel of
+    clinical variables drawn from the dictionary, and (iv)
+    cross-cohort correlation deviation as a triage map for measurement
+    disagreement.
 
     All analyses are descriptive. No hypothesis tests are performed and
     no inferential statistics are reported.
@@ -56,12 +60,14 @@ def _():
 @app.cell
 def _():
     # Knobs surfaced at the top so the reader can see them at a glance.
+    # `STUDY_IDS` is the single source of truth for which Gen3 cohorts
+    # the pipeline runs against — every downstream cell iterates this.
     KEY_FILE = "/Users/harrijh/keys/acdc_api_key_staging.json"
     PROGRAM = "program1"
-    PROJECTS = ("CDAH", "EDCAD-PMS")
+    STUDY_IDS = ("CDAH", "EDCAD-PMS", "AusDiab", "Baker-Biobank", "CAUGHT-CAD")
     MIN_PAIRWISE_N = 30  # mask Spearman cells with pairwise N below this
     DASH = "—"
-    return DASH, KEY_FILE, MIN_PAIRWISE_N, PROGRAM, PROJECTS
+    return DASH, KEY_FILE, MIN_PAIRWISE_N, PROGRAM, STUDY_IDS
 
 
 @app.cell
@@ -164,24 +170,22 @@ def _():
 
 
 @app.cell
-def _(KEY_FILE, PROGRAM, PROJECTS, fetch_all_metadata, flatten, mo):
+def _(KEY_FILE, PROGRAM, STUDY_IDS, fetch_all_metadata, flatten, mo):
     # Live fetch + flatten. This is the slow cell — Gen3 round-trip.
-    _flats = {}
-    for _proj in PROJECTS:
-        _result = fetch_all_metadata(KEY_FILE, PROGRAM, _proj)
-        _flats[_proj] = flatten(_result.to_df())
-    cdah_flat = _flats["CDAH"]
-    edcad_pms_flat = _flats["EDCAD-PMS"]
+    flats = {}
+    for _study in STUDY_IDS:
+        _result = fetch_all_metadata(KEY_FILE, PROGRAM, _study)
+        flats[_study] = flatten(_result.to_df())
 
-    mo.md(
-        f"""
-        After flattening, the analytic samples comprised
-        **{cdah_flat.shape[0]:,}** CDAH subjects ({cdah_flat.shape[1]} columns)
-        and **{edcad_pms_flat.shape[0]:,}** EDCAD-PMS subjects
-        ({edcad_pms_flat.shape[1]} columns).
-        """
+    _summary = "\n".join(
+        f"- **{_study}**: {_df.shape[0]:,} subjects × {_df.shape[1]} columns"
+        for _study, _df in flats.items()
     )
-    return cdah_flat, edcad_pms_flat
+    mo.md(
+        "After flattening, the analytic samples comprised:\n\n"
+        f"{_summary}"
+    )
+    return (flats,)
 
 
 @app.cell
@@ -250,8 +254,6 @@ def _(DASH, pd):
         ("Exposures", "Drinks per week (string)", "exposure__drinks_per_week_string", "continuous"),
     ]
 
-    STUDY_COLS = ("CDAH", "EDCAD-PMS", "Overall")
-
     def fmt_continuous(s):
         s = pd.to_numeric(s, errors="coerce").dropna()
         if s.empty:
@@ -271,59 +273,81 @@ def _(DASH, pd):
         n = int(counts.sum())
         return [(level, f"{int(c)} ({c / n * 100:.1f}%)") for level, c in counts.items()]
 
-    def build_table(cdah, edcad, pooled):
+    def build_table(frames, pooled):
+        """Build Table 1 from a {study_id: DataFrame} dict.
+
+        Per-cohort columns are emitted in `frames` insertion order, with
+        a trailing `Overall` column that is populated only when every
+        cohort contains the variable.
+        """
+        study_cols = (*frames.keys(), "Overall")
+        empty_row = {"Domain": "", "Variable": "", "Level": "", **{c: "" for c in study_cols}}
+
         rows = []
         last_domain = None
         for domain, label, col, kind in SPEC:
-            in_cdah = col in cdah.columns
-            in_edcad = col in edcad.columns
-            if not (in_cdah or in_edcad):
+            present = {study: (col in df.columns) for study, df in frames.items()}
+            if not any(present.values()):
                 continue
             if domain != last_domain:
-                rows.append({"Domain": domain, "Variable": "", "Level": "", **{c: "" for c in STUDY_COLS}})
+                rows.append({**empty_row, "Domain": domain})
                 last_domain = domain
 
-            overall_applicable = in_cdah and in_edcad
+            overall_applicable = all(present.values())
 
             if kind == "continuous":
-                cdah_cell = fmt_continuous(cdah[col]) if in_cdah else DASH
-                edcad_cell = fmt_continuous(edcad[col]) if in_edcad else DASH
-                overall_cell = fmt_continuous(pooled[col]) if overall_applicable else DASH
-                rows.append({
-                    "Domain": "", "Variable": label, "Level": "",
-                    "CDAH": cdah_cell, "EDCAD-PMS": edcad_cell, "Overall": overall_cell,
-                })
+                cells = {
+                    study: (fmt_continuous(df[col]) if present[study] else DASH)
+                    for study, df in frames.items()
+                }
+                cells["Overall"] = fmt_continuous(pooled[col]) if overall_applicable else DASH
+                rows.append({"Domain": "", "Variable": label, "Level": "", **cells})
             else:
-                cdah_levels = categorical_rows(cdah[col]) if in_cdah else []
-                edcad_levels = categorical_rows(edcad[col]) if in_edcad else []
+                per_study_levels = {
+                    study: (categorical_rows(df[col]) if present[study] else [])
+                    for study, df in frames.items()
+                }
                 overall_levels = categorical_rows(pooled[col]) if overall_applicable else []
-                cdah_n = sum(int(v.split(" ")[0]) for _, v in cdah_levels) if cdah_levels else (0 if in_cdah else None)
-                edcad_n = sum(int(v.split(" ")[0]) for _, v in edcad_levels) if edcad_levels else (0 if in_edcad else None)
-                overall_n = sum(int(v.split(" ")[0]) for _, v in overall_levels) if overall_levels else None
 
-                rows.append({
-                    "Domain": "", "Variable": label, "Level": "",
-                    "CDAH": (f"N={cdah_n}" if in_cdah else DASH),
-                    "EDCAD-PMS": (f"N={edcad_n}" if in_edcad else DASH),
-                    "Overall": (f"N={overall_n}" if overall_applicable else DASH),
-                })
+                # Header row: total N per column (or em-dash if absent).
+                header_cells = {}
+                for study, levels in per_study_levels.items():
+                    if not present[study]:
+                        header_cells[study] = DASH
+                    else:
+                        n = sum(int(v.split(" ")[0]) for _, v in levels) if levels else 0
+                        header_cells[study] = f"N={n}"
+                if overall_applicable:
+                    overall_n = sum(int(v.split(" ")[0]) for _, v in overall_levels) if overall_levels else 0
+                    header_cells["Overall"] = f"N={overall_n}"
+                else:
+                    header_cells["Overall"] = DASH
+                rows.append({"Domain": "", "Variable": label, "Level": "", **header_cells})
+
+                # Level union, ordered by overall frequency where available,
+                # then by per-cohort frequency.
                 level_order = []
-                for src in (overall_levels, cdah_levels, edcad_levels):
+                for src in (overall_levels, *per_study_levels.values()):
                     for lvl, _ in src:
                         if lvl not in level_order:
                             level_order.append(lvl)
-                cdah_map = dict(cdah_levels)
-                edcad_map = dict(edcad_levels)
+                study_maps = {study: dict(levels) for study, levels in per_study_levels.items()}
                 overall_map = dict(overall_levels)
                 for lvl in level_order:
-                    rows.append({
-                        "Domain": "", "Variable": "", "Level": f"  {lvl}",
-                        "CDAH": cdah_map.get(lvl, "0 (0.0%)") if in_cdah else DASH,
-                        "EDCAD-PMS": edcad_map.get(lvl, "0 (0.0%)") if in_edcad else DASH,
-                        "Overall": overall_map.get(lvl, "0 (0.0%)") if overall_applicable else DASH,
-                    })
+                    level_cells = {
+                        study: (
+                            study_maps[study].get(lvl, "0 (0.0%)")
+                            if present[study]
+                            else DASH
+                        )
+                        for study in frames
+                    }
+                    level_cells["Overall"] = (
+                        overall_map.get(lvl, "0 (0.0%)") if overall_applicable else DASH
+                    )
+                    rows.append({"Domain": "", "Variable": "", "Level": f"  {lvl}", **level_cells})
 
-        return pd.DataFrame(rows, columns=["Domain", "Variable", "Level", *STUDY_COLS])
+        return pd.DataFrame(rows, columns=["Domain", "Variable", "Level", *study_cols])
 
     def to_markdown(df):
         cols = list(df.columns)
@@ -341,13 +365,13 @@ def _(DASH, pd):
 
 
 @app.cell
-def _(build_table, cdah_flat, edcad_pms_flat, mo, pd, to_markdown):
+def _(build_table, flats, mo, pd, to_markdown):
     _pooled = pd.concat(
-        [cdah_flat.assign(study="CDAH"), edcad_pms_flat.assign(study="EDCAD-PMS")],
+        [df.assign(study=study) for study, df in flats.items()],
         ignore_index=True,
         sort=False,
     )
-    table_one_df = build_table(cdah_flat, edcad_pms_flat, _pooled)
+    table_one_df = build_table(flats, _pooled)
 
     mo.vstack(
         [
@@ -458,9 +482,10 @@ def _(DASH, leaves_list, linkage, np, pd, pdist):
 
 
 @app.cell
-def _(cdah_flat, edcad_pms_flat):
-    # Single dict consumed by every Act 2 / Act 4 cell.
-    frames_miss = {"CDAH": cdah_flat, "EDCAD-PMS": edcad_pms_flat}
+def _(flats):
+    # Alias kept for clarity in the missingness section; the underlying
+    # data is the same dict produced by the live-fetch cell.
+    frames_miss = flats
     return (frames_miss,)
 
 
@@ -864,11 +889,8 @@ def _(MIN_PAIRWISE_N, leaves_list, linkage, np, pd, plt, squareform, warnings):
 
 
 @app.cell
-def _(canonical_order, cdah_flat, edcad_pms_flat, prepare_frame):
-    frames_corr = {
-        "CDAH": prepare_frame(cdah_flat),
-        "EDCAD-PMS": prepare_frame(edcad_pms_flat),
-    }
+def _(canonical_order, flats, prepare_frame):
+    frames_corr = {study: prepare_frame(df) for study, df in flats.items()}
     corr_order = canonical_order(frames_corr)
     return corr_order, frames_corr
 
@@ -896,47 +918,27 @@ def _(
 
     mo.md(
         f"Spearman rank correlation matrices were computed for "
-        f"{len(rhos)} cohorts ({', '.join(rhos.keys())}) and are "
-        f"presented in Figures 3 and 4 below."
+        f"{len(rhos)} cohorts ({', '.join(rhos.keys())}); each is "
+        f"shown in its own tab below."
     )
     return figs_corr, rhos
 
 
 @app.cell
-def _(figs_corr):
-    figs_corr["CDAH"]
-    return
-
-
-@app.cell
-def _(MIN_PAIRWISE_N, mo):
-    mo.md(f"""
-    **Figure 3.** Within-cohort Spearman rank correlation matrix for
-    CDAH. Cells are coloured on a diverging scale (RdBu_r,
-    [−1, +1]); annotated values are ρ. Blank cells indicate the
-    variable was not collected; cells annotated `n/a` indicate the
-    pairwise sample size was below {MIN_PAIRWISE_N}. Variables follow
-    the canonical order described in §3 and are grouped by Gen3 node
-    (red separators).
-    """)
-    return
-
-
-@app.cell
-def _(figs_corr):
-    figs_corr["EDCAD-PMS"]
-    return
-
-
-@app.cell
-def _(MIN_PAIRWISE_N, mo):
-    mo.md(f"""
-    **Figure 4.** Within-cohort Spearman rank correlation matrix for
-    EDCAD-PMS, on the same canonical variable order and colour scale
-    as Figure 3 to permit direct visual comparison. Cells annotated
-    `n/a` correspond to pairwise N below {MIN_PAIRWISE_N}; blank cells
-    correspond to variables not collected by EDCAD-PMS.
-    """)
+def _(MIN_PAIRWISE_N, figs_corr, mo):
+    mo.vstack([
+        mo.md(
+            "**Figure 3.** Within-cohort Spearman rank correlation "
+            "matrices, one tab per cohort. All matrices use the "
+            "canonical variable order described in §3 and the same "
+            "diverging colour scale (RdBu_r, [−1, +1]); annotated "
+            "values are ρ. Blank cells indicate the variable was not "
+            "collected by that cohort; cells annotated `n/a` indicate "
+            f"the pairwise sample size was below {MIN_PAIRWISE_N}. "
+            "Variables are grouped by Gen3 node (red separators)."
+        ),
+        mo.ui.tabs(figs_corr),
+    ])
     return
 
 
@@ -950,7 +952,7 @@ def _(mo):
     Spearman ρ observed across cohorts (`max ρ − min ρ`). Cells in
     which fewer than two cohorts contribute a valid ρ (i.e.
     cohort-exclusive variables, or pairs with insufficient pairwise N
-    in one cohort) and the matrix diagonal are masked. Higher values
+    in any cohort) and the matrix diagonal are masked. Higher values
     therefore identify variable pairs whose estimated correlation is
     least consistent across cohorts; under perfect agreement the
     statistic is 0, and the worst-case theoretical value (sign flip
@@ -982,20 +984,20 @@ def _(corr_order, make_max_deviation_fig, max_deviation_matrix, mo, rhos):
         [
             deviation_fig,
             mo.md(
-                "**Figure 5.** Cross-cohort correlation deviation, "
+                "**Figure 4.** Cross-cohort correlation deviation, "
                 "computed as `max ρ − min ρ` across cohorts for each "
                 "variable pair. Cells are coloured on a sequential "
                 "scale (Reds, [0, 2]); brighter cells indicate greater "
                 "between-cohort disagreement on the corresponding "
                 "pair. The diagonal and pairs estimated in fewer than "
                 "two cohorts are masked. Variables follow the "
-                "canonical order used in Figures 3 and 4."
+                "canonical order used in Figure 3."
             ),
             mo.md(
                 "**Table 2.** Pairwise correlation deviations sorted "
                 "in descending order (upper triangle only). Pairs at "
                 "the top of the table contribute the brightest cells "
-                "in Figure 5."
+                "in Figure 4."
             ),
             mo.ui.table(_long.reset_index(drop=True), page_size=30),
         ]
@@ -1018,7 +1020,7 @@ def _(mo):
 
     The reported statistics are descriptive and intended to inform
     subsequent data-cleaning, harmonisation, and analytic decisions.
-    Pairs with the largest cross-cohort deviation in Figure 5 and
+    Pairs with the largest cross-cohort deviation in Figure 4 and
     Table 2 are the natural entry points for follow-up review of
     measurement procedures, units, and coding conventions.
 
