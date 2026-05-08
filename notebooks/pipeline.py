@@ -28,6 +28,38 @@ def _(mo):
 
 @app.cell
 def _():
+    # ---- Environment setup ---------------------------------------------
+    # Check for required packages and pip-install any that are missing.
+    # On a system where all packages are already present this cell is a
+    # no-op (no network calls, no installs). On a fresh environment it
+    # installs only what's missing and then proceeds.
+    import importlib.util
+    import subprocess
+    import sys
+
+    # (import_name, pip_spec) — import_name is what we probe; pip_spec
+    # is what we hand to pip if it's absent.
+    _required = [
+        ("marimo", "marimo"),
+        ("gen3_metadata", "gen3-metadata==1.4.0"),
+        ("pandas", "pandas"),
+        ("numpy", "numpy"),
+        ("matplotlib", "matplotlib>=3.10"),
+        ("scipy", "scipy>=1.17"),
+    ]
+    _missing = [
+        spec for mod, spec in _required if importlib.util.find_spec(mod) is None
+    ]
+    if _missing:
+        print(f"Installing missing packages: {_missing}")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", *_missing]
+        )
+    return
+
+
+@app.cell
+def _():
     import marimo as mo
 
     return (mo,)
