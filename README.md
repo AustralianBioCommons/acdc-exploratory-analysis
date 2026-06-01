@@ -21,3 +21,10 @@ that is gitignored) and update the `key_file` path in the first cell of the note
 
 - `notebooks/exploratory.py` — marimo notebook; first cell fetches ACDC metadata.
 - `pyproject.toml` — Poetry-managed dependencies (`marimo`, `gen3-metadata==1.4.0`, `pandas`).
+
+
+## To export to html
+```bash
+DATETIME=$(date +%Y%m%d_%H%M%S)
+poetry run marimo export html --no-include-code notebooks/pipeline.py -o outputs/${DATETIME}_acdc_exploratory_analysis.html
+```

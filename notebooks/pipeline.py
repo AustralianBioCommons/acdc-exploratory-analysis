@@ -9,6 +9,8 @@ def _(mo):
     mo.md("""
     # ACDC exploratory analysis
 
+    *Analysis date: 2026-05-12*
+
     This notebook analyses the **clinical variables defined in the
     ACDC Gen3 Data Dictionary** across one or more contributing
     cohorts (configured at the top of the notebook). Baseline metadata
@@ -63,6 +65,26 @@ def _():
     import marimo as mo
 
     return (mo,)
+
+
+@app.cell
+def _(mo):
+    def csv_download(df, filename, label=None, index=True):
+        """Download button serving `df` as CSV.
+
+        Bytes are embedded eagerly (rather than via a callable) so the
+        button keeps working in the static HTML export produced by
+        `marimo export html` — marimo inlines the virtual file into the
+        HTML, so no server is needed.
+        """
+        return mo.download(
+            data=df.to_csv(index=index).encode("utf-8"),
+            filename=filename,
+            mimetype="text/csv",
+            label=label or f"Download {filename}",
+        )
+
+    return (csv_download,)
 
 
 @app.cell
@@ -397,7 +419,7 @@ def _(DASH, pd):
 
 
 @app.cell
-def _(build_table, flats, mo, pd, to_markdown):
+def _(build_table, csv_download, flats, mo, pd, to_markdown):
     _pooled = pd.concat(
         [df.assign(study=study) for study, df in flats.items()],
         ignore_index=True,
@@ -409,6 +431,7 @@ def _(build_table, flats, mo, pd, to_markdown):
         [
             mo.md("Sortable rendering of Table 1 (click a column header to sort)."),
             mo.ui.table(table_one_df, page_size=50),
+            csv_download(table_one_df, "table_one.csv", index=False),
             mo.md("Manuscript rendering of Table 1."),
             mo.md(to_markdown(table_one_df)),
         ]
@@ -522,7 +545,7 @@ def _(flats):
 
 
 @app.cell
-def _(completeness_summary, frames_miss, mo):
+def _(completeness_summary, csv_download, frames_miss, mo):
     completeness_df = completeness_summary(frames_miss)
     mo.vstack(
         [
@@ -533,13 +556,23 @@ def _(completeness_summary, frames_miss, mo):
                 "the variable was not collected by that cohort."
             ),
             mo.ui.table(completeness_df, page_size=50),
+            csv_download(completeness_df, "completeness_summary.csv", index=False),
         ]
     )
     return
 
 
 @app.cell
-def _(completeness_matrix, frames_miss, np, pd, plt, union_variables):
+def _(
+    completeness_matrix,
+    csv_download,
+    frames_miss,
+    mo,
+    np,
+    pd,
+    plt,
+    union_variables,
+):
     # ---- Variable completeness heatmap (inlined from plot_completeness_heatmap) ----
 
     _all_vars = union_variables(frames_miss)
@@ -586,7 +619,12 @@ def _(completeness_matrix, frames_miss, np, pd, plt, union_variables):
         "Variable completeness by study (gray = variable not collected)",
         fontsize=11,
     )
-    completeness_fig
+    mo.vstack(
+        [
+            completeness_fig,
+            csv_download(_pct_df, "completeness_matrix.csv"),
+        ]
+    )
     return
 
 
@@ -603,12 +641,25 @@ def _(mo):
 
 
 @app.cell
-def _(cluster_order, frames_miss, np, plt, union_variables):
+def _(
+    cluster_order,
+    csv_download,
+    frames_miss,
+    mo,
+    np,
+    pd,
+    plt,
+    union_variables,
+):
     # ---- Subject × variable missingness heatmap (inlined from plot_heatmap) ----
 
     _all_vars = union_variables(frames_miss)
     _studies = list(frames_miss.items())
     _width_ratios = [max(1, len(df)) for _, df in _studies]
+
+    # Per-study binary matrices (variables × subjects, in the clustered
+    # column order shown in the figure) collected for CSV download.
+    _missing_csv = {}
 
     missingness_fig, _axes = plt.subplots(
         1,
@@ -629,6 +680,7 @@ def _(cluster_order, frames_miss, np, plt, union_variables):
 
         _order = cluster_order(_matrix.T)
         _ordered = _matrix[:, _order]
+        _missing_csv[_study] = pd.DataFrame(_ordered, index=_all_vars)
 
         _ax.imshow(_ordered, aspect="auto", cmap="binary_r", interpolation="nearest", vmin=0, vmax=1)
         _ax.set_title(f"{_study} — n={len(_df)} subjects")
@@ -650,7 +702,19 @@ def _(cluster_order, frames_miss, np, plt, union_variables):
         "Variable × subject missingness, faceted by study (white = present, black = missing)",
         fontsize=11,
     )
-    missingness_fig
+    mo.vstack(
+        [
+            missingness_fig,
+            mo.md("Per-cohort missingness matrices (1 = present, 0 = missing):"),
+            mo.hstack(
+                [
+                    csv_download(_df, f"missingness_{_study}.csv")
+                    for _study, _df in _missing_csv.items()
+                ],
+                justify="start",
+            ),
+        ]
+    )
     return
 
 
@@ -957,7 +1021,7 @@ def _(
 
 
 @app.cell
-def _(MIN_PAIRWISE_N, figs_corr, mo):
+def _(MIN_PAIRWISE_N, csv_download, figs_corr, mo, rhos):
     mo.vstack([
         mo.md(
             "**Figure 3.** Within-cohort Spearman rank correlation "
@@ -970,6 +1034,14 @@ def _(MIN_PAIRWISE_N, figs_corr, mo):
             "Variables are grouped by Gen3 node (red separators)."
         ),
         mo.ui.tabs(figs_corr),
+        mo.md("Per-cohort Spearman ρ matrices:"),
+        mo.hstack(
+            [
+                csv_download(_rho, f"correlation_{_study}.csv")
+                for _study, _rho in rhos.items()
+            ],
+            justify="start",
+        ),
     ])
     return
 
@@ -998,7 +1070,14 @@ def _(mo):
 
 
 @app.cell
-def _(corr_order, make_max_deviation_fig, max_deviation_matrix, mo, rhos):
+def _(
+    corr_order,
+    csv_download,
+    make_max_deviation_fig,
+    max_deviation_matrix,
+    mo,
+    rhos,
+):
     deviation_df = max_deviation_matrix(rhos, corr_order)
     deviation_fig = make_max_deviation_fig(deviation_df)
 
@@ -1015,6 +1094,7 @@ def _(corr_order, make_max_deviation_fig, max_deviation_matrix, mo, rhos):
     mo.vstack(
         [
             deviation_fig,
+            csv_download(deviation_df, "deviation_matrix.csv"),
             mo.md(
                 "**Figure 4.** Cross-cohort correlation deviation, "
                 "computed as `max ρ − min ρ` across cohorts for each "
@@ -1032,34 +1112,13 @@ def _(corr_order, make_max_deviation_fig, max_deviation_matrix, mo, rhos):
                 "in Figure 4."
             ),
             mo.ui.table(_long.reset_index(drop=True), page_size=30),
+            csv_download(
+                _long.reset_index(drop=True),
+                "deviation_pairs.csv",
+                index=False,
+            ),
         ]
     )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## 5. Summary
-
-    Section 1 documented cohort sizes and baseline distributions.
-    Section 2 characterised variable- and subject-level missingness
-    and identified outcome and follow-up coverage. Section 3 reported
-    within-cohort Spearman correlation structure across a
-    pre-specified clinical panel. Section 4 quantified cross-cohort
-    correlation deviation as a triage statistic for measurement
-    disagreement.
-
-    The reported statistics are descriptive and intended to inform
-    subsequent data-cleaning, harmonisation, and analytic decisions.
-    Pairs with the largest cross-cohort deviation in Figure 4 and
-    Table 2 are the natural entry points for follow-up review of
-    measurement procedures, units, and coding conventions.
-
-    This notebook does not write any artefacts to disk; the
-    command-line scripts in `scripts/` remain the canonical source for
-    reproducible output files.
-    """)
     return
 
 
