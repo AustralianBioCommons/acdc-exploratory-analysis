@@ -16,9 +16,10 @@ def _(mo):
     cohorts (configured at the top of the notebook). Baseline metadata
     are retrieved live from Gen3 and flattened to one record per
     subject, after which we report (i) cohort characteristics, (ii)
-    variable- and subject-level missing data, (iii) within-cohort
+    cross-cohort outlier screening of the numeric variables, (iii)
+    variable- and subject-level missing data, (iv) within-cohort
     Spearman rank correlations across a pre-specified panel of
-    clinical variables drawn from the dictionary, and (iv)
+    clinical variables drawn from the dictionary, and (v)
     cross-cohort correlation deviation as a triage map for measurement
     disagreement.
 
@@ -442,7 +443,445 @@ def _(build_table, csv_download, flats, mo, pd, to_markdown):
 @app.cell
 def _(mo):
     mo.md("""
-    ## 2. Missing data assessment
+    ## 2. Outlier assessment
+
+    Each numeric variable is screened within every cohort for values that
+    sit far from the rest, since a single mistyped or wrong-unit entry can
+    distort later summaries. Two classical rules are reported together:
+
+    - **Z-score (standard score).** How many standard deviations (SD) a
+      value lies from the cohort mean: `z = (value − mean) / SD`. A value
+      is flagged when `|z| > 3` (beyond three SDs, which covers about
+      99.7% of a bell-shaped distribution). It is simple but assumes a
+      roughly normal shape, so it can over-flag skewed variables.
+    - **IQR (interquartile range) rule.** The IQR is `Q3 − Q1`, where Q1
+      and Q3 are the 25th and 75th percentiles. A value is flagged when it
+      falls below `Q1 − 1.5 × IQR` or above `Q3 + 1.5 × IQR` — the same
+      rule a box plot's whiskers use. Being based on percentiles, it is
+      robust to skew.
+
+    Both rules are applied separately within each cohort, so every study
+    is judged against its own spread. Nothing is changed or removed — a
+    flag simply marks a value worth a closer look, not necessarily an
+    error.
+    """)
+    return
+
+
+@app.cell
+def _(DASH, np, pd):
+    # ---- Outlier helpers (Z-score + IQR rule) ----
+
+    # Mirrors CONTINUOUS_VARS in the correlation section (§4); kept local
+    # so this section is self-contained.
+    OUTLIER_CONTINUOUS_VARS = (
+        "demographic__baseline_age",
+        "demographic__bmi_baseline",
+        "demographic__height_baseline_measured",
+        "demographic__weight_baseline_measured",
+        "demographic__height_baseline_self_reported",
+        "demographic__weight_baseline_self_reported",
+        "blood_pressure_test__bp_systolic",
+        "blood_pressure_test__bp_diastolic",
+        "medical_history__heart_rate",
+        "lab_result__total_cholesterol",
+        "lab_result__hdl",
+        "lab_result__ldl",
+        "lab_result__triglycerides",
+        "lab_result__glucose_fasting",
+        "lab_result__creatinine_serum_enzymatic",
+        "lab_result__creatinine_serum_jaffe",
+        "lab_result__egfr_baseline_ckdepi",
+        "lab_result__egfr_baseline_mdrd",
+        "lab_result__cac_score",
+        "exposure__cigarettes_per_day",
+        "exposure__drinks_per_week",
+    )
+
+    Z_THRESH = 3.0  # flag values more than 3 standard deviations from the mean
+    IQR_K = 1.5  # IQR fence multiplier
+
+    def _numeric(series):
+        return pd.to_numeric(series, errors="coerce")
+
+    def normalize_outlier_frame(df):
+        """Coerce the drinks-per-week string column to numeric so it can
+        be screened like the other continuous variables (mirrors the
+        handling in prepare_frame, §4)."""
+        if (
+            "exposure__drinks_per_week" not in df.columns
+            and "exposure__drinks_per_week_string" in df.columns
+        ):
+            df = df.copy()
+            df["exposure__drinks_per_week"] = pd.to_numeric(
+                df["exposure__drinks_per_week_string"], errors="coerce"
+            )
+        return df
+
+    def zscores(series):
+        """Standard scores: (x - mean) / SD, where SD is the standard
+        deviation. When SD is zero or undefined (a constant or empty
+        variable) all scores are 0. NaN inputs propagate to NaN scores.
+        """
+        x = _numeric(series)
+        sd = x.std()
+        if sd and not np.isnan(sd):
+            return (x - x.mean()) / sd
+        return pd.Series(0.0, index=x.index).where(x.notna())
+
+    def zscore_outliers(series, thresh=Z_THRESH):
+        """Boolean mask of Z-score outliers, |z| > thresh (NaN positions False)."""
+        return zscores(series).abs() > thresh
+
+    def iqr_fences(series, k=IQR_K):
+        """Return (lower, upper) IQR fences (Q1-1.5*IQR, Q3+1.5*IQR)."""
+        x = _numeric(series).dropna()
+        if x.empty:
+            return (np.nan, np.nan)
+        q1, q3 = x.quantile(0.25), x.quantile(0.75)
+        iqr = q3 - q1
+        return (q1 - k * iqr, q3 + k * iqr)
+
+    def iqr_outliers(series, k=IQR_K):
+        """Boolean mask of IQR-fence outliers (NaN positions False)."""
+        x = _numeric(series)
+        lo, hi = iqr_fences(x, k)
+        if np.isnan(lo):
+            return pd.Series(False, index=series.index)
+        return (x < lo) | (x > hi)
+
+    def present_outlier_vars(frames, variables):
+        """Variables collected (with at least one numeric value) anywhere."""
+        return [
+            v
+            for v in variables
+            if any(
+                v in df.columns and _numeric(df[v]).notna().any()
+                for df in frames.values()
+            )
+        ]
+
+    def _rate_matrix(mask_fn, frames, variables):
+        # rows=study, cols=variable; % of non-missing values flagged.
+        data = {}
+        for study, df in frames.items():
+            col = []
+            for var in variables:
+                if var not in df.columns:
+                    col.append(np.nan)
+                    continue
+                n = int(_numeric(df[var]).notna().sum())
+                col.append(
+                    np.nan if n == 0 else mask_fn(df[var]).sum() / n * 100.0
+                )
+            data[study] = col
+        return pd.DataFrame(data, index=list(variables)).T
+
+    def outlier_rate_matrices(frames, variables):
+        """(% flagged by Z-score, % flagged by IQR) as study × variable frames."""
+        return (
+            _rate_matrix(zscore_outliers, frames, variables),
+            _rate_matrix(iqr_outliers, frames, variables),
+        )
+
+    def outlier_summary(frames, variables):
+        """Long table: one row per (variable, study) with both flag counts."""
+        rows = []
+        for var in variables:
+            for study, df in frames.items():
+                if var not in df.columns:
+                    continue
+                n = int(_numeric(df[var]).notna().sum())
+                if n == 0:
+                    continue
+                n_z = int(zscore_outliers(df[var]).sum())
+                n_iqr = int(iqr_outliers(df[var]).sum())
+                lo, hi = iqr_fences(df[var])
+                rows.append(
+                    {
+                        "variable": var,
+                        "study": study,
+                        "n": n,
+                        "n_outlier_z": n_z,
+                        "pct_z": f"{n_z / n * 100:.1f}%",
+                        "n_outlier_iqr": n_iqr,
+                        "pct_iqr": f"{n_iqr / n * 100:.1f}%",
+                        "iqr_lower": round(lo, 2) if not np.isnan(lo) else DASH,
+                        "iqr_upper": round(hi, 2) if not np.isnan(hi) else DASH,
+                    }
+                )
+        return pd.DataFrame(rows)
+
+    def outlier_long_table(frames, variables):
+        """One row per flagged subject-value (flagged by either rule)."""
+        rows = []
+        for var in variables:
+            for study, df in frames.items():
+                if var not in df.columns:
+                    continue
+                x = _numeric(df[var])
+                z = zscores(df[var])
+                z_mask = x.notna() & (z.abs() > Z_THRESH)
+                iqr_mask = iqr_outliers(df[var])
+                flagged = z_mask | iqr_mask
+                if not flagged.any():
+                    continue
+                ids = (
+                    df["subject_submitter_id"]
+                    if "subject_submitter_id" in df.columns
+                    else pd.Series(df.index, index=df.index)
+                )
+                for idx in df.index[flagged]:
+                    rows.append(
+                        {
+                            "study": study,
+                            "subject_submitter_id": ids.loc[idx],
+                            "variable": var,
+                            "value": x.loc[idx],
+                            "z": round(float(z.loc[idx]), 2),
+                            "flag_z": bool(z_mask.loc[idx]),
+                            "flag_iqr": bool(iqr_mask.loc[idx]),
+                        }
+                    )
+        out = pd.DataFrame(rows)
+        if not out.empty:
+            out = out.reindex(
+                out["z"].abs().sort_values(ascending=False).index
+            ).reset_index(drop=True)
+        return out
+
+    return (
+        OUTLIER_CONTINUOUS_VARS,
+        normalize_outlier_frame,
+        outlier_long_table,
+        outlier_rate_matrices,
+        outlier_summary,
+        present_outlier_vars,
+    )
+
+
+@app.cell
+def _(
+    OUTLIER_CONTINUOUS_VARS,
+    flats,
+    normalize_outlier_frame,
+    outlier_long_table,
+    outlier_rate_matrices,
+    outlier_summary,
+    present_outlier_vars,
+):
+    flats_out = {s: normalize_outlier_frame(df) for s, df in flats.items()}
+    outlier_vars = present_outlier_vars(flats_out, OUTLIER_CONTINUOUS_VARS)
+    rate_z_df, rate_iqr_df = outlier_rate_matrices(flats_out, outlier_vars)
+    outlier_summary_df = outlier_summary(flats_out, outlier_vars)
+    outlier_long_df = outlier_long_table(flats_out, outlier_vars)
+    return (
+        flats_out,
+        outlier_long_df,
+        outlier_summary_df,
+        outlier_vars,
+        rate_iqr_df,
+        rate_z_df,
+    )
+
+
+@app.cell
+def _(csv_download, mo, np, pd, plt, rate_iqr_df, rate_z_df):
+    # ---- Outlier-rate heatmap (Z-score + IQR), mirroring the §3 completeness
+    # heatmap so the two read on the same visual grammar ----
+
+    def _rate_heatmap(pct_df, title):
+        _matrix = np.ma.masked_invalid(pct_df.to_numpy(dtype=float))
+        _cmap = plt.get_cmap("OrRd").copy()
+        _cmap.set_bad("#cccccc")
+        _n_studies, _n_vars = _matrix.shape
+        _fig, _ax = plt.subplots(
+            figsize=(max(10.0, 0.28 * _n_vars), 4.0 + 0.6 * _n_studies),
+            constrained_layout=True,
+        )
+        _im = _ax.imshow(
+            _matrix, aspect="auto", cmap=_cmap,
+            interpolation="nearest", vmin=0, vmax=20,
+        )
+        for _i in range(_n_studies):
+            for _j in range(_n_vars):
+                _val = pct_df.iat[_i, _j]
+                if pd.isna(_val):
+                    _ax.text(_j, _i, "N/A", ha="center", va="center",
+                             fontsize=6, color="black")
+                else:
+                    _ax.text(_j, _i, f"{_val:.1f}", ha="center", va="center",
+                             fontsize=6, color="white" if _val >= 12 else "black")
+        _ax.set_yticks(range(_n_studies))
+        _ax.set_yticklabels(list(pct_df.index), fontsize=10)
+        _ax.set_xticks(range(_n_vars))
+        _ax.set_xticklabels(list(pct_df.columns), rotation=90, fontsize=6)
+        _ax.set_xlabel("variables (grouped by node)")
+
+        _last_prefix = None
+        for _j, _var in enumerate(pct_df.columns):
+            _prefix = _var.split("__", 1)[0]
+            if _last_prefix is not None and _prefix != _last_prefix:
+                _ax.axvline(_j - 0.5, color="red", linewidth=0.4, alpha=0.6)
+            _last_prefix = _prefix
+
+        _cbar = _fig.colorbar(_im, ax=_ax, fraction=0.025, pad=0.01)
+        _cbar.set_label("% non-missing values flagged as outliers")
+        _fig.suptitle(title, fontsize=11)
+        return _fig
+
+    outlier_rate_tabs = mo.ui.tabs(
+        {
+            "Z-score (|z| > 3)": _rate_heatmap(
+                rate_z_df,
+                "Outlier rate by study — Z-score "
+                "(gray = variable not collected)",
+            ),
+            "IQR (1.5 × IQR rule)": _rate_heatmap(
+                rate_iqr_df,
+                "Outlier rate by study — IQR rule "
+                "(gray = variable not collected)",
+            ),
+        }
+    )
+
+    mo.vstack(
+        [
+            outlier_rate_tabs,
+            mo.md(
+                "**Figure 1.** Per-variable outlier rate by cohort, shown "
+                "for both flagging rules (select a tab). Each cell is the "
+                "percentage of non-missing values flagged as outliers (OrRd "
+                "scale, capped at 20%); grey cells annotated `N/A` indicate "
+                "the variable was not collected by that cohort. Rates are "
+                "computed within each cohort, and variables are grouped by "
+                "Gen3 node (red separators). Bright cells or large Z-score–IQR "
+                "discrepancies flag variables to inspect for unit or coding "
+                "errors."
+            ),
+            mo.hstack(
+                [
+                    csv_download(rate_z_df, "outlier_rate_z.csv"),
+                    csv_download(rate_iqr_df, "outlier_rate_iqr.csv"),
+                ],
+                justify="start",
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(flats_out, mo, np, outlier_long_df, outlier_vars, pd, plt):
+    # ---- Violin plots faceted by variable, one violin per cohort ----
+
+    _studies = list(flats_out.keys())
+    _ncols = 4
+    _nrows = -(-len(outlier_vars) // _ncols)  # ceil division
+
+    violin_fig, _axes = plt.subplots(
+        _nrows,
+        _ncols,
+        figsize=(4.0 * _ncols, 3.2 * _nrows),
+        constrained_layout=True,
+    )
+    _axes = np.array(_axes).reshape(-1)
+
+    for _k, _var in enumerate(outlier_vars):
+        _ax = _axes[_k]
+        _data, _positions = [], []
+        for _pos, _study in enumerate(_studies, start=1):
+            _df = flats_out[_study]
+            if _var not in _df.columns:
+                continue
+            _vals = pd.to_numeric(_df[_var], errors="coerce").dropna()
+            if len(_vals) < 2:
+                continue
+            _data.append(_vals.to_numpy())
+            _positions.append(_pos)
+            # overlay this cohort's flagged values as red points
+            _flagged = outlier_long_df[
+                (outlier_long_df["variable"] == _var)
+                & (outlier_long_df["study"] == _study)
+            ]["value"]
+            if len(_flagged):
+                _ax.scatter(
+                    np.full(len(_flagged), _pos), _flagged,
+                    s=4, color="red", alpha=0.4, zorder=3,
+                )
+        if _data:
+            _parts = _ax.violinplot(
+                _data, positions=_positions,
+                showmedians=True, showextrema=False,
+            )
+            for _body in _parts["bodies"]:
+                _body.set_facecolor("#9ecae1")
+                _body.set_alpha(0.7)
+        _ax.set_title(_var.split("__", 1)[-1], fontsize=8)
+        _ax.set_xticks(range(1, len(_studies) + 1))
+        _ax.set_xticklabels(_studies, rotation=90, fontsize=6)
+        _ax.tick_params(axis="y", labelsize=6)
+
+    for _k in range(len(outlier_vars), len(_axes)):
+        _axes[_k].set_visible(False)
+
+    violin_fig.suptitle(
+        "Distribution of each numeric variable by cohort "
+        "(red points = flagged outliers)",
+        fontsize=11,
+    )
+    mo.vstack(
+        [
+            violin_fig,
+            mo.md(
+                "**Figure 2.** Distribution of each numeric variable, one "
+                "violin per cohort. A violin is wide where values are "
+                "common and narrow where they are rare, the horizontal line "
+                "marks the median, and red points are the values flagged as "
+                "outliers. Putting the cohorts side by side makes "
+                "differences in level, spread, and outlier load easy to "
+                "see — a unit error in one cohort, for example, shifts its "
+                "whole violin away from the others."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(csv_download, mo, outlier_long_df, outlier_summary_df):
+    mo.vstack(
+        [
+            mo.md(
+                "**Table 2.** Per-variable, per-cohort outlier counts under "
+                "both rules. `n` is the non-missing sample size; "
+                "`n_outlier_z`/`pct_z` use the Z-score (|z| > 3); "
+                "`n_outlier_iqr`/`pct_iqr` use the IQR rule (1.5 × IQR "
+                "fences, whose values are given by `iqr_lower`/`iqr_upper`). "
+                "Click a column header to sort and surface the worst "
+                "offenders."
+            ),
+            mo.ui.table(outlier_summary_df, page_size=30),
+            csv_download(outlier_summary_df, "outlier_summary.csv", index=False),
+            mo.md(
+                "**Table 3.** Individual flagged values (flagged by either "
+                "rule), sorted by |Z|. `flag_z`/`flag_iqr` indicate which "
+                "rule(s) flagged each value and `z` is the Z-score. Use "
+                "this to trace specific subjects for review."
+            ),
+            mo.ui.table(outlier_long_df, page_size=30),
+            csv_download(
+                outlier_long_df, "outlier_flagged_values.csv", index=False
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    ## 3. Missing data assessment
 
     Variable-level completeness was computed as the proportion of
     non-missing values per variable per cohort, after excluding
@@ -631,7 +1070,7 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    **Figure 1.** Variable completeness by cohort. Each cell is the
+    **Figure 3.** Variable completeness by cohort. Each cell is the
     percentage of subjects with a non-missing value for that variable
     (OrRd scale, 0–100%); grey cells annotated `N/A` indicate the
     variable was not collected by that cohort. Variables are grouped
@@ -721,7 +1160,7 @@ def _(
 @app.cell
 def _(mo):
     mo.md("""
-    **Figure 2.** Subject × variable missingness, faceted by cohort.
+    **Figure 4.** Subject × variable missingness, faceted by cohort.
     Cells are binary (white = present, black = missing). Subjects
     (columns) are ordered by hierarchical clustering on the
     missingness vector (Hamming distance, average linkage); vertical
@@ -735,7 +1174,7 @@ def _(mo):
 @app.cell
 def _(MIN_PAIRWISE_N, mo):
     mo.md(f"""
-    ## 3. Within-cohort correlation structure
+    ## 4. Within-cohort correlation structure
 
     Spearman rank correlations were computed within each cohort across
     a pre-specified panel of continuous, ordinal, and binary clinical
@@ -1024,9 +1463,9 @@ def _(
 def _(MIN_PAIRWISE_N, csv_download, figs_corr, mo, rhos):
     mo.vstack([
         mo.md(
-            "**Figure 3.** Within-cohort Spearman rank correlation "
+            "**Figure 5.** Within-cohort Spearman rank correlation "
             "matrices, one tab per cohort. All matrices use the "
-            "canonical variable order described in §3 and the same "
+            "canonical variable order described in §4 and the same "
             "diverging colour scale (RdBu_r, [−1, +1]); annotated "
             "values are ρ. Blank cells indicate the variable was not "
             "collected by that cohort; cells annotated `n/a` indicate "
@@ -1049,7 +1488,7 @@ def _(MIN_PAIRWISE_N, csv_download, figs_corr, mo, rhos):
 @app.cell
 def _(mo):
     mo.md("""
-    ## 4. Cross-cohort correlation deviation
+    ## 5. Cross-cohort correlation deviation
 
     To summarise disagreement between cohorts, we computed for each
     variable pair the difference between the maximum and minimum
@@ -1096,20 +1535,20 @@ def _(
             deviation_fig,
             csv_download(deviation_df, "deviation_matrix.csv"),
             mo.md(
-                "**Figure 4.** Cross-cohort correlation deviation, "
+                "**Figure 6.** Cross-cohort correlation deviation, "
                 "computed as `max ρ − min ρ` across cohorts for each "
                 "variable pair. Cells are coloured on a sequential "
                 "scale (Reds, [0, 2]); brighter cells indicate greater "
                 "between-cohort disagreement on the corresponding "
                 "pair. The diagonal and pairs estimated in fewer than "
                 "two cohorts are masked. Variables follow the "
-                "canonical order used in Figure 3."
+                "canonical order used in Figure 5."
             ),
             mo.md(
-                "**Table 2.** Pairwise correlation deviations sorted "
+                "**Table 4.** Pairwise correlation deviations sorted "
                 "in descending order (upper triangle only). Pairs at "
                 "the top of the table contribute the brightest cells "
-                "in Figure 4."
+                "in Figure 6."
             ),
             mo.ui.table(_long.reset_index(drop=True), page_size=30),
             csv_download(
