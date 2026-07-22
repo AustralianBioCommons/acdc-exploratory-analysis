@@ -1561,5 +1561,272 @@ def _(
     return
 
 
+@app.cell
+def _(MIN_PAIRWISE_N, mo):
+    mo.md(f"""
+    ## 6. BMI internal-consistency check
+
+    Each cohort supplies a pre-computed body-mass index
+    (`demographic__bmi_baseline`) alongside the height and weight it was
+    presumably derived from. This section recomputes BMI from those height
+    and weight values using `BMI = weight (kg) / height (m)^2` and compares
+    it against the provided BMI within each cohort. The check is run
+    separately for the two recorded sources — **measured** and
+    **self-reported** height/weight — so each can be validated in its own
+    right and the source the provided BMI was derived from can be
+    identified. Where the provided value is genuinely derived from a given
+    source, the two agree almost exactly: points fall on the `y = x`
+    identity line and the correlation approaches 1. Departures flag a
+    cohort whose BMI, height, or weight values disagree — a wrong unit, a
+    mis-mapped column, or a placeholder code — and warrant a closer look.
+
+    For each cohort and source we report the number of paired (both values
+    present) subjects, the Pearson correlation (linear agreement) and the
+    Spearman rank correlation between provided and calculated BMI.
+    Correlations are masked (shown as an em-dash) where the paired N falls
+    below {MIN_PAIRWISE_N}; cohorts missing the BMI column or a source's
+    height/weight columns are flagged in the `note` column.
+
+    As elsewhere, this is a descriptive internal-consistency check on
+    measurement and coding. No hypothesis tests are performed and no
+    inferential statistics are reported.
+    """)
+    return
+
+
+@app.cell
+def _(pd):
+    # ---- BMI consistency helpers ----
+
+    # The provided BMI and the height/weight sources it is checked against.
+    # Height is in metres and weight in kg, so BMI = weight / height**2.
+    # Each source maps to its (height_col, weight_col); dict order sets the
+    # tab order in the scatter figure (measured first, then self-reported).
+    BMI_GIVEN_COL = "demographic__bmi_baseline"
+    BMI_SOURCES = {
+        "measured": (
+            "demographic__height_baseline_measured",
+            "demographic__weight_baseline_measured",
+        ),
+        "self-reported": (
+            "demographic__height_baseline_self_reported",
+            "demographic__weight_baseline_self_reported",
+        ),
+    }
+
+    def bmi_calc(height, weight):
+        """Calculated BMI = weight(kg) / height(m)**2, element-wise.
+
+        Both inputs are coerced to numeric. A value is only computed where
+        the height is present and strictly positive (guarding against
+        division by zero / impossible zero heights) and the weight is
+        present; everywhere else the result is NaN.
+        """
+        h = pd.to_numeric(height, errors="coerce")
+        w = pd.to_numeric(weight, errors="coerce")
+        valid = h.notna() & (h > 0) & w.notna()
+        return (w / (h ** 2)).where(valid)
+
+    def bmi_pairs_for(df, given_col, height_col, weight_col):
+        """Pairwise-complete (subject, given_bmi, calc_bmi) frame.
+
+        Returns an empty frame with the expected columns when any required
+        column is absent, so a cohort missing BMI or a source's
+        height/weight simply contributes no pairs.
+        """
+        cols = ["subject_submitter_id", "given_bmi", "calc_bmi"]
+        if not all(c in df.columns for c in (given_col, height_col, weight_col)):
+            return pd.DataFrame(columns=cols)
+
+        ids = (
+            df["subject_submitter_id"]
+            if "subject_submitter_id" in df.columns
+            else pd.Series(df.index, index=df.index)
+        )
+        pair = pd.DataFrame(
+            {
+                "subject_submitter_id": ids,
+                "given_bmi": pd.to_numeric(df[given_col], errors="coerce"),
+                "calc_bmi": bmi_calc(df[height_col], df[weight_col]),
+            }
+        )
+        return pair.dropna(subset=["given_bmi", "calc_bmi"]).reset_index(drop=True)
+
+    def bmi_corr_row(study, source, pair, given_present, source_present, min_n, dash):
+        """One summary row: paired N, Pearson r, Spearman rho, and a note.
+
+        Correlations are reported only when the paired N reaches `min_n`
+        and both columns vary; otherwise (and for the diagonal degenerate
+        cases) they are shown as `dash`.
+        """
+        if not given_present:
+            note = "BMI not provided"
+        elif not source_present:
+            note = f"{source} height/weight not collected"
+        elif len(pair) == 0:
+            note = "no paired observations"
+        else:
+            note = ""
+
+        n = len(pair)
+        pearson = dash
+        spearman = dash
+        if n >= min_n:
+            r = pair[["given_bmi", "calc_bmi"]].corr(method="pearson").iloc[0, 1]
+            rho = pair[["given_bmi", "calc_bmi"]].corr(method="spearman").iloc[0, 1]
+            pearson = dash if pd.isna(r) else round(float(r), 3)
+            spearman = dash if pd.isna(rho) else round(float(rho), 3)
+
+        return {
+            "study": study,
+            "source": source,
+            "n": n,
+            "pearson_r": pearson,
+            "spearman_rho": spearman,
+            "note": note,
+        }
+
+    return BMI_GIVEN_COL, BMI_SOURCES, bmi_corr_row, bmi_pairs_for
+
+
+@app.cell
+def _(
+    BMI_GIVEN_COL,
+    BMI_SOURCES,
+    DASH,
+    MIN_PAIRWISE_N,
+    STUDY_IDS,
+    bmi_corr_row,
+    bmi_pairs_for,
+    flats,
+    pd,
+):
+    # Nested {source: {study: pair_df}}; one summary row per (source, study).
+    bmi_pairs = {}
+    _bmi_rows = []
+    for _src, (_hcol, _wcol) in BMI_SOURCES.items():
+        bmi_pairs[_src] = {}
+        for _study in STUDY_IDS:
+            _df = flats[_study]
+            _given_present = BMI_GIVEN_COL in _df.columns
+            _source_present = _hcol in _df.columns and _wcol in _df.columns
+            _pair = bmi_pairs_for(_df, BMI_GIVEN_COL, _hcol, _wcol)
+            bmi_pairs[_src][_study] = _pair
+            _bmi_rows.append(
+                bmi_corr_row(
+                    _study, _src, _pair, _given_present, _source_present,
+                    MIN_PAIRWISE_N, DASH,
+                )
+            )
+
+    bmi_summary_df = pd.DataFrame(
+        _bmi_rows,
+        columns=["study", "source", "n", "pearson_r", "spearman_rho", "note"],
+    )
+    return bmi_pairs, bmi_summary_df
+
+
+@app.cell
+def _(BMI_SOURCES, STUDY_IDS, bmi_pairs, mo, np, plt):
+    # ---- Given-vs-calculated BMI scatter, one subplot per cohort, one
+    # tab per height/weight source (mirroring the §2 outlier-rate tabs) ----
+
+    def _bmi_scatter_grid(source):
+        _studies = list(STUDY_IDS)
+        _ncols = 3
+        _nrows = -(-len(_studies) // _ncols)  # ceil division
+        _fig, _axes = plt.subplots(
+            _nrows,
+            _ncols,
+            figsize=(4.0 * _ncols, 3.8 * _nrows),
+            constrained_layout=True,
+        )
+        _axes = np.array(_axes).reshape(-1)
+
+        for _k, _study in enumerate(_studies):
+            _ax = _axes[_k]
+            _pair = bmi_pairs[source][_study]
+            if _pair.empty:
+                _ax.text(
+                    0.5, 0.5, "not collected",
+                    ha="center", va="center", fontsize=9, color="gray",
+                    transform=_ax.transAxes,
+                )
+                _ax.set_title(_study, fontsize=9)
+                _ax.set_xticks([])
+                _ax.set_yticks([])
+                continue
+
+            _ax.scatter(_pair["given_bmi"], _pair["calc_bmi"], s=8, alpha=0.4)
+            _lo = float(min(_pair["given_bmi"].min(), _pair["calc_bmi"].min()))
+            _hi = float(max(_pair["given_bmi"].max(), _pair["calc_bmi"].max()))
+            _ax.plot([_lo, _hi], [_lo, _hi], color="red", lw=0.8, zorder=3)
+            _ax.set_aspect("equal")
+            _ax.set_xlabel("given BMI", fontsize=8)
+            _ax.set_ylabel("calculated BMI", fontsize=8)
+            _ax.set_title(f"{_study} — n={len(_pair)}", fontsize=9)
+            _ax.tick_params(labelsize=6)
+
+        for _k in range(len(_studies), len(_axes)):
+            _axes[_k].set_visible(False)
+
+        _fig.suptitle(
+            f"Provided vs calculated BMI by cohort — {source} height/weight "
+            "(red line = perfect agreement, y = x)",
+            fontsize=11,
+        )
+        return _fig
+
+    bmi_scatter_tabs = mo.ui.tabs(
+        {_src: _bmi_scatter_grid(_src) for _src in BMI_SOURCES}
+    )
+
+    mo.vstack(
+        [
+            bmi_scatter_tabs,
+            mo.md(
+                "**Figure 7.** Provided BMI (x) versus BMI recomputed from "
+                "recorded height and weight (y), one subplot per cohort, with "
+                "a tab for each source (measured / self-reported). The red "
+                "line is the `y = x` identity: points on it indicate the "
+                "provided BMI matches the height/weight values, and points "
+                "off it indicate disagreement. A cohort whose height is a "
+                "constant placeholder (e.g. EDCAD-PMS measured at 2.0 m) "
+                "collapses to a vertical band well off the identity line — "
+                "the intended signal that its BMI cannot be reconstructed "
+                "from the recorded values; cohorts that did not collect a "
+                "source are shown as `not collected`."
+            ),
+        ]
+    )
+    return
+
+
+@app.cell
+def _(bmi_summary_df, csv_download, mo):
+    mo.vstack(
+        [
+            mo.md(
+                "**Table 5.** Per-cohort BMI internal consistency, with one "
+                "row per cohort and `source` (measured / self-reported). `n` "
+                "is the number of subjects with both a provided and a "
+                "calculable BMI; `pearson_r` and `spearman_rho` are the "
+                "correlations between the provided and calculated values "
+                "(shown `—` when `n` is below the masking threshold or a "
+                "correlation is undefined). `note` flags cohorts missing the "
+                "BMI column or that source's height/weight columns. High "
+                "correlations with points on the identity line in Figure 7 "
+                "indicate the provided BMI is consistent with the recorded "
+                "height and weight for that source."
+            ),
+            mo.ui.table(bmi_summary_df, page_size=30),
+            csv_download(
+                bmi_summary_df, "bmi_consistency_summary.csv", index=False
+            ),
+        ]
+    )
+    return
+
+
 if __name__ == "__main__":
     app.run()
